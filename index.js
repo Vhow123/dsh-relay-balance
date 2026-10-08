@@ -33,6 +33,19 @@ const MAX_INTERVAL_MS = 24 * 60 * 60 * 1000
 const REQUEST_TIMEOUT_MS = 15_000
 /** 令牌剩余寿命低于该值就提前续期（ms） */
 const TOKEN_SKEW_MS = 120_000
+/**
+ * new-api 的 CriticalRateLimit 是按 IP 计的（middleware/rate-limit.go 里 key = mark + ClientIP），
+ * 登录 / auth/refresh / 安全验证 / 重新生成令牌 共用同一个桶（默认 20 次 / 20 分钟）。
+ * 浏览器和插件同 IP，所以这份预算必须全局共享，绝不能按站点各算一份。
+ * 预算刻意留大半给浏览器：宁可角标数字旧一点，也不能把面板登录挡住。
+ */
+const CRITICAL_BUDGET = 8
+/** 上游关键限流的窗口长度（ms），与 new-api 的 CriticalRateLimitDuration 默认值一致 */
+const CRITICAL_WINDOW_MS = 20 * 60 * 1000
+/** 撞到 429 后单站点首次退避时长（ms）：退满一个上游窗口 */
+const CRITICAL_BACKOFF_MS = 20 * 60 * 1000
+/** 单站点退避上限（ms）：连续失败也不会退到天荒地老 */
+const CRITICAL_MAX_BACKOFF_MS = 6 * 60 * 60 * 1000
 /** 调度器心跳（ms）：只决定「什么时候该去问一次」，与真实刷新间隔解耦 */
 const TICK_MS = 5_000
 /** 站点数量上限：角标是给人瞄一眼的，不是监控大盘 */
@@ -654,18 +667,73 @@ export function apply(ctx) {
   }
 
   /**
+   * 关键操作闸门。new-api 对登录 / auth/refresh / 安全验证 / 重新生成令牌 有一个按 IP 计的硬预算
+   * （默认 20 次 / 20 分钟），浏览器和插件共用同一份。插件过去每 30 秒就 refresh 一次（20 分钟 40 次），
+   * 把整台机器的额度打爆，连面板登录都被 429 挡住。
+   * 这里做两件事：① 全局滑动窗口预算，所有 new-api 站点共享一份；② 撞到 429 就按站点指数退避。
+   */
+  const criticalHits = []
+  const criticalBlocked = new Map()
+
+  /** 当前窗口内还剩几次关键操作额度（顺带把过期时间戳丢掉） */
+  function criticalBudgetLeft(now = Date.now()) {
+    const cutoff = now - CRITICAL_WINDOW_MS
+    while (criticalHits.length && criticalHits[0] < cutoff) criticalHits.shift()
+    return Math.max(0, CRITICAL_BUDGET - criticalHits.length)
+  }
+
+  /** 放行返回 null；拦下返回给用户看的原因 */
+  function criticalGate(site) {
+    const now = Date.now()
+    const blocked = criticalBlocked.get(site.id)
+    if (blocked && now < blocked.until) {
+      return `上游限流退避中（还需 ${Math.ceil((blocked.until - now) / 1000)} 秒）`
+    }
+    if (criticalBudgetLeft(now) <= 0) {
+      return '本机关键操作预算已用尽（上游按 IP 计 20 分钟一档），暂缓'
+    }
+    return null
+  }
+
+  /** 每次真正发出去关键请求前记账 */
+  function criticalNoteSent() {
+    criticalHits.push(Date.now())
+  }
+
+  /** 撞 429：按站点指数退避，首次就退满一个上游窗口 */
+  function criticalNote429(site) {
+    const prev = criticalBlocked.get(site.id)
+    const fails = (prev ? prev.fails : 0) + 1
+    const wait = Math.min(CRITICAL_MAX_BACKOFF_MS, CRITICAL_BACKOFF_MS * 2 ** (fails - 1))
+    criticalBlocked.set(site.id, { until: Date.now() + wait, fails })
+    return wait
+  }
+
+  /** 关键请求成功：清掉该站点的退避状态 */
+  function criticalNoteOk(site) {
+    criticalBlocked.delete(site.id)
+  }
+
+  /**
    * new-api 令牌轮换：POST /api/user/auth/refresh，成功后原地换新令牌。
    * 凭证以 new_api_refresh cookie 为主路径（实测 cookie 单独就能换到新包，只带 X-Auth-Session 头会被 401 拒），
    * 同时也带 sid 头，兼容那些只认头的分支。
    */
   async function newApiRefresh(site) {
     if (!site.sessionCookie && !site.sessionSid) return false
+    // 闸门：预算用尽或该站点还在退避期，直接不发请求
+    if (criticalGate(site)) return false
     try {
+      criticalNoteSent()
       const res = await apiRequest(site, NEWAPI_REFRESH_PATH, {
         method: 'POST',
         cookie: site.sessionCookie || undefined,
         sessionSid: site.sessionSid || undefined,
       })
+      if (res.status === 429) {
+        criticalNote429(site)
+        return false
+      }
       if (res.status !== 200) return false
       const body = res.body && typeof res.body === 'object' ? res.body : null
       if (!body || body.success !== true) return false
@@ -676,6 +744,7 @@ export function apply(ctx) {
       if (auth.accessExpiresAt) site.accessExpiresAt = auth.accessExpiresAt
       // 上游每次轮换都会下发新的 new_api_refresh cookie，必须跟着更新，否则下次就换不动了
       if (auth.sessionCookie) site.sessionCookie = auth.sessionCookie
+      criticalNoteOk(site)
       saveConfig()
       return true
     } catch {
@@ -695,14 +764,21 @@ export function apply(ctx) {
     if (!site.loginEmail || !site.password) return false
     const last = reloginAt.get(site.id) || 0
     if (Date.now() - last < RELOGIN_COOLDOWN_MS) return false
+    // 闸门：登录接口也吃同一份按 IP 计的关键限流预算
+    if (criticalGate(site)) return false
     reloginAt.set(site.id, Date.now())
     try {
+      criticalNoteSent()
       const auth = await newApiLogin(site.baseUrl, { username: site.loginEmail, password: site.password })
-      if (!auth.ok) return false
+      if (!auth.ok) {
+        if (auth.status === 429) criticalNote429(site)
+        return false
+      }
       if (auth.accessToken) site.accessToken = auth.accessToken
       if (auth.sessionSid) site.sessionSid = auth.sessionSid
       if (auth.sessionCookie) site.sessionCookie = auth.sessionCookie
       if (auth.accessExpiresAt) site.accessExpiresAt = auth.accessExpiresAt
+      criticalNoteOk(site)
       saveConfig()
       return true
     } catch {
@@ -725,8 +801,13 @@ export function apply(ctx) {
       const left = site.accessExpiresAt - Math.floor(Date.now() / 1000)
       if (left < NEWAPI_REFRESH_MARGIN_SEC) await newApiRefresh(site)
     }
-    // 只有轮换凭证没有令牌（例如令牌已被上游清掉）时，先换一个出来
-    if (!site.accessToken && (site.sessionCookie || site.sessionSid)) await newApiRefresh(site)
+    // 只有轮换凭证没有令牌（例如令牌已被上游清掉）时，先换一个出来。
+    // 被闸门拦下就直接报原因，别再往下走那条只会换来一串 401 的兜底路径。
+    if (!site.accessToken && (site.sessionCookie || site.sessionSid)) {
+      const blocked = criticalGate(site)
+      if (blocked) throw new Error(blocked)
+      await newApiRefresh(site)
+    }
     if (site.accessToken) {
       let res = await apiRequest(site, NEWAPI_SELF_PATH, { token: site.accessToken })
       if (res.status === 401 && (await newApiRefresh(site))) {
@@ -894,6 +975,11 @@ export function apply(ctx) {
       hasSessionCookie: Boolean(site.sessionCookie),
       hasSessionSid: Boolean(site.sessionSid),
       tokenExpiresAt: exp > 0 ? new Date(exp * 1000).toISOString() : null,
+      // 撞了上游关键限流正在退避时，前端能看到还要等多久
+      rateLimitedUntil: (() => {
+        const blocked = criticalBlocked.get(site.id)
+        return blocked && blocked.until > Date.now() ? new Date(blocked.until).toISOString() : null
+      })(),
       // new-api 的 access_expires_at 是 unix 秒
       accessExpiresAt:
         typeof site.accessExpiresAt === 'number' ? new Date(site.accessExpiresAt * 1000).toISOString() : null,

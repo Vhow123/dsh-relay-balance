@@ -1,6 +1,6 @@
 {
   "name": "dsh-relay-balance",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "中转站余额角标 — 在 DSH 界面角落实时显示多个 API 中转站账户余额（支持多站点）",
   "type": "module",
   "main": "index.js",
