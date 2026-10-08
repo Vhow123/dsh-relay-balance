@@ -58,15 +58,56 @@ dsh plugin --profile desktop remove dsh-relay-balance
 | 方式 | 适用场景 | 怎么拿 |
 |---|---|---|
 | **账号密码** | 面板开放服务端密码登录（`password_login_enabled: true`） | 直接填用户名与密码。勾「记住密码」会把密码明文写进本机配置文件 |
-| **手动令牌** | 面板能签发长期令牌 | 面板「个人设置 → 系统访问令牌」复制；或 F12 → Application → Local Storage 复制 `auth_token`（sub2api 系建议连 `refresh_token` 一起填） |
+| **手动令牌** | 面板能签发长期令牌 | **new-api 系**：面板左侧边栏 →「个人设置」→「安全与访问」→「访问令牌」→「重新生成」，复制只显示一次的那串系统访问令牌（详见下节）；**sub2api 系**：F12 → Application → Local Storage 复制 `auth_token`（建议连 `refresh_token` 一起填） |
 | **会话 Cookie** | 开了 Cloudflare 人机验证、服务端密码登录被上游拒的站点 | F12 → Application → Cookies → 复制 `new_api_refresh` 的值粘进来 |
 
 > **人机验证的岔路**：new-api 面板若开了 Turnstile（`/api/status` 里 `turnstile_check: true`），服务端密码登录会被上游直接拒（报 `Turnstile token 为空`）；sub2api 系同理（`settings/public` 里 `turnstile_enabled: true`）。这两类站点只能走手动令牌或会话 Cookie。
+
+### new-api 的「系统访问令牌」怎么拿
+
+new-api 系的令牌**不在 Local Storage 里**，得让面板自己签发：
+
+1. 用浏览器登录该站点面板。
+2. 左侧边栏 →「个人设置」→「安全与访问」（地址栏形如 `https://面板域名/security`）。
+3. 找到「访问令牌」区块 → 点「重新生成」。这一步会先弹「安全验证」，要求再输一次登录密码。
+4. 弹出来的那串就是系统访问令牌，**只显示这一次**，复制走。
+
+拿到之后：点角标 → 该站点 `编辑` → 登录方式选「手动令牌」→ 粘到**第一个框 `auth_token`** → 保存。
+
+> **别粘到「会话 Cookie」框里。** 那个框要的是浏览器 DevTools 里的 `new_api_refresh` cookie，和令牌完全是两回事；粘错了上游会回 `Unauthorized, invalid access token`（浏览器/插件把这个错原样透出来）。
+>
+> 这串令牌可以直接打 `GET /api/user/self`（`Authorization: Bearer <token>`）读余额，而且**不占**关键操作限流额度（见下节）—— 所以开不了服务端登录的站点，优先用它，而不是会话 Cookie。
+
+也可以不经 UI，直接调宿主接口写进去：
+
+```powershell
+curl.exe -X POST http://127.0.0.1:19387/relay-balance/sites `
+  -H 'Content-Type: application/json' `
+  --data-binary '{"action":"update","id":"<站点id>","site":{"accessToken":"<系统访问令牌>"}}'
+```
+
+`<站点id>` 从 `GET /relay-balance/state` 的 `sites[].id` 取。
 
 ### 令牌续期
 
 - **sub2api**：用 `refresh_token` 打 `POST /api/v1/auth/refresh` 换新令牌。
 - **newapi**：access token 只活 900 秒。插件在剩余不足 120 秒时，用 **`new_api_refresh` cookie** 打 `POST /api/user/auth/refresh` 原地轮换。实测只带 `X-Auth-Session` 头会被上游 401 拒 —— **cookie 才是唯一凭证**，轮换下发的新 cookie 会跟着更新。
+
+### 关键操作限流（0.3.0）
+
+new-api 对 **登录 / `auth/refresh` / 安全验证 / 重新生成令牌** 有一份**按 IP 计**的硬预算（`CriticalRateLimit`，默认 **20 次 / 20 分钟**；`middleware/rate-limit.go` 里 `key = mark + ClientIP()`）。浏览器和插件同一个出口 IP，**共用同一个桶** —— 插件打多了，你自己的面板登录就会吃 429。
+
+0.3.0 之前，插件对「有 Cookie 但没令牌」的站点**每个刷新周期都调一次 `auth/refresh`**；间隔设成 30 秒就是 20 分钟 40 次，是配额的两倍，必然把整台机器的额度打爆，面板登录跟着一起被挡。
+
+现在的做法：
+
+- **全局预算** `CRITICAL_BUDGET = 8`，所有 new-api 站点**共享**一份，剩下 12 次留给浏览器 —— 宁可角标数字旧一点，也不能把面板登录挡住。
+- **429 退避**：按站点独立，首次撞到就退满一个上游窗口（20 分钟），连续失败翻倍，上限 6 小时；一旦成功立刻清零。
+- 被闸门拦下时不再硬发请求：站点状态直接给出原因（`本机关键操作预算已用尽（上游按 IP 计 20 分钟一档），暂缓` / `上游限流退避中（还需 N 秒）`），快照里另有 `rateLimitedUntil`，也不会再级联成一串 401。
+
+> 想彻底不占这份额度，就用**系统访问令牌**（见上节）—— `GET /api/user/self` 不受 `CriticalRateLimit` 保护，`PUT /api/user/self` 才受。
+>
+> 已经吃到 429 了怎么办：停手等 20 分钟让窗口滑过去，别反复重试（每试一次都算一次，窗口会一直往后推）。
 
 ## 设置项
 
@@ -105,7 +146,8 @@ dsh plugin --profile desktop remove dsh-relay-balance
   "sites": [{ "id", "name", "baseUrl", "flavor", "loginMode", "enabled", "configured",
               "status", "balance", "account", "error", "updatedAt",
               "hasAccessToken", "hasRefreshToken", "tokenExpiresAt",
-              "hasSessionSid", "hasSessionCookie", "accessExpiresAt" }],
+              "hasSessionSid", "hasSessionCookie", "accessExpiresAt",
+              "rateLimitedUntil" }],   // 撞了上游关键限流时是退避截止时间，否则 null
   "config": { "intervalMs", "corner", "badgeMode", "activeSiteId", ... }
 }
 ```
