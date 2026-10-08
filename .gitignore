@@ -1,0 +1,20 @@
+# 本地调试脚本（内含本机绝对路径与实测凭据，不对外发布）
+.probe/
+
+# 依赖与日志
+node_modules/
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# 本地配置与打包产物
+*.tgz
+*.zip

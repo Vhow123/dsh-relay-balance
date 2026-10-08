@@ -1,0 +1,9 @@
+# dsh-relay-balance bundle patch — 当本包被列进 profile 的 dsh.profile.bundles 时叠加。
+#
+# 单一双面行，由本包的 package.json 解析：
+#   - 宿主半部（index.js）：余额抓取 + 凭证续期 + /relay-balance HTTP 接口，走 ctx.webServer
+#   - 浏览器半部（lib/client.js，经 exports["./client"] 与 dsh.client 声明）：
+#     界面角落的余额角标（shell.overlay 席位）+ 点击展开的详情/配置面板
+- insert:
+    - id: relay-balance
+      name: 'dsh-relay-balance'

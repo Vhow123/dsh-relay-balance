@@ -1,0 +1,10 @@
+# 统一换行符，避免 Windows 上 CRLF 与仓库里的 LF 反复互改
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.zip binary
+*.tgz binary
